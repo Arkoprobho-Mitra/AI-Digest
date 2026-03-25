@@ -156,7 +156,6 @@ function xmlDate(el) {
   return null;
 }
 
-// ── Gemini 2.5 Pro via Vertex AI ────────────────────────────────
 // ── Gemini via Vertex AI (Split-Call Architecture) ──────────────
 function summariseWithVertex(articles, projectId, region) {
   var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'MMMM d, yyyy');
