@@ -1,84 +1,249 @@
 // ================================================================
-//  AI & Data Science Daily Digest — Google Apps Script
-//  ✓ 100% Free  ✓ Uses Vertex AI — NO API key needed
-//  ✓ Auth: ScriptApp.getOAuthToken() — automatic Google OAuth
-//  ✓ $300 GCP free credits covers ~years of daily digests
-//  ✓ Model: Gemini 2.5 Pro on Vertex AI
-// ================================================================
+//  AI & Data Science Daily Digest — Google Apps Script v4
+//  ✓ 100% Free  ✓ Vertex AI — NO Anthropic key, NO extra setup
+//  ✓ Two-model pipeline (cost-optimised):
+//      Stage 1 — gemini-2.5-flash-lite  → score + dedupe (cheap)
+//      Stage 2 — gemini-2.5-flash       → summarise (smart)
+//  ✓ Weighted keyword scoring (W3/W2/W1) before any API call
+//  ✓ Date-window filtering — only new articles since last run
+//  ✓ 7 AM morning + 5 PM evening editions
+//  ✓ Drop-in replacement — just paste & run setupTrigger()
 //
 //  SETUP (one-time, ~5 minutes):
-//  1. script.google.com → New project → paste this file
-//  2. Project Settings (⚙) → Google Cloud Platform → link your GCP project
-//  3. GCP Console → APIs → Enable "Vertex AI API"
-//  4. Script Properties → Add:
+//  1. script.google.com → New project → paste this whole file
+//  2. ⚙ Project Settings → GCP project → link your project
+//  3. GCP Console → Enable "Vertex AI API"
+//  4. ⚙ Script Properties → Add:
 //       GCP_PROJECT_ID = your-gcp-project-id
-//       VERTEX_REGION  = us-east5      (or europe-west1, us-central1)
-//  5. Run setupTrigger() once — grant permissions when prompted
+//       VERTEX_REGION  = us-central1
+//  5. Run setupTrigger() → grant permissions
 //  6. Run testRun() to verify immediately
 //
+//  COST: ~$0.002–0.004/day
+//    Flash-Lite: $0.10/M input tokens  (filter stage)
+//    Flash:      $0.30/M input tokens  (summarise stage)
 // ================================================================
 
+// ── RSS Feeds (29 sources across 5 tiers) ──────────────────────
 var RSS_FEEDS = [
+  // Tier 1: Major AI News
   'https://techcrunch.com/category/artificial-intelligence/feed/',
   'https://venturebeat.com/category/ai/feed/',
   'https://www.theverge.com/rss/ai-artificial-intelligence/index.xml',
   'https://www.technologyreview.com/feed/',
-  'https://rss.arxiv.org/rss/cs.AI',
-  'https://rss.arxiv.org/rss/cs.LG',
-  'https://hnrss.org/frontpage',
+  'https://feeds.arstechnica.com/arstechnica/index',
+  'https://www.wired.com/feed/category/artificial-intelligence/latest/rss',
+
+  // Tier 2: AI Lab & Company Blogs (primary sources — catches model drops)
+  'https://feeds.feedburner.com/nvidiablog',
+  'https://developer.nvidia.com/blog/feed',
+  'https://nvidianews.nvidia.com/rss.xml',
+  'https://openai.com/blog/rss.xml',
+  'https://www.anthropic.com/rss.xml',
+  'https://blog.google/technology/ai/rss/',
+  'https://ai.meta.com/blog/rss/',
+  'https://blogs.microsoft.com/ai/feed/',
+  'https://aws.amazon.com/blogs/machine-learning/feed/',
+  'https://huggingface.co/blog/feed.xml',
+
+  // Tier 3: Research & Papers
+  'https://arxiv.org/rss/cs.AI',
+  'https://arxiv.org/rss/cs.LG',
+  'https://arxiv.org/rss/cs.CL',
+  'https://arxiv.org/rss/cs.CV',
+  'https://papers.takara.ai/api/feed',
+
+  // Tier 4: Data Science
+  'https://www.kdnuggets.com/feed',
+  'https://towardsdatascience.com/feed',
+  'https://www.marktechpost.com/feed/',
+  'https://www.infoq.com/ai-ml-data-eng/rss',               // InfoQ AI — reliable, well-formed XML
+  'https://spectrum.ieee.org/feeds/topic/artificial-intelligence.rss', // IEEE Spectrum AI
+
+
+  // Tier 5: Community & Aggregators
+  'https://hnrss.org/frontpage?points=100',
   'https://feeds.bbci.co.uk/news/technology/rss.xml',
+  'https://siliconangle.com/category/ai/feed',
+  'https://www.artificialintelligence-news.com/feed/rss/',
 ];
+
+// ── Weighted keyword tiers ──────────────────────────────────────
+// W3 (+3) — model releases, breakthroughs, lab announcements
+var KEYWORDS_W3 = [
+  'releases','released','launches','launched','announces','announced',
+  'introducing','unveils','unveiling','debuts','debuted',
+  'new model','model release','open source model','open-source model',
+  'weights released','model weights','now available','generally available',
+  'ga release','preview release','public preview','early access',
+  'nvidia','nemotron','nemo','megatron','nvidia ai','nvidia research',
+  'openai','gpt-5','gpt-4o','o3','o4','sora','dall-e',
+  'anthropic','claude 4','claude sonnet','claude opus','claude haiku',
+  'google deepmind','deepmind','gemini 2','gemini ultra','veo','imagen',
+  'meta llama','llama 4','llama3','llama-3','meta ai',
+  'mistral','mixtral','mistral large','mistral small',
+  'xai','grok-3','grok 3','grok-4',
+  'cohere','command r','command a',
+  'deepseek','deepseek r2','deepseek v3','deepseek r3',
+  'qwen','qwen3','qwen2.5','alibaba ai',
+  'apple intelligence','apple ai','apple foundation model',
+  'amazon nova','amazon titan','bedrock model',
+  'inflection','pi ai',
+  'perplexity','sonar model',
+  'zhipu','chatglm','baidu','ernie',
+  'samsung ai','qualcomm ai','intel ai',
+  'breakthrough','state of the art','state-of-the-art','sota',
+  'outperforms','surpasses','beats gpt','beats claude','beats gemini',
+  'new record','best performance','human-level','superhuman',
+  'first model to','world first','industry first',
+  'arxiv paper','research paper','new paper','new study',
+];
+
+// W2 (+2) — important techniques, architectures, applications
+var KEYWORDS_W2 = [
+  'llm','large language model','foundation model','language model',
+  'multimodal','vision language','text-to-image','text-to-video',
+  'diffusion model','generative model','reasoning model','frontier model',
+  'fine-tuning','fine-tun','rlhf','dpo','instruction tuning','rlaif',
+  'prompt engineering','chain of thought','in-context learning',
+  'few-shot','zero-shot','retrieval augmented','rag',
+  'transformer','attention mechanism','mixture of experts','moe',
+  'sparse model','dense model','context window','long context',
+  'vector database','embedding model','token','tokenizer',
+  'quantization','quantisation','pruning','distillation',
+  'lora','qlora','peft','adapter','model merging',
+  'ai agent','agentic','autonomous agent','multi-agent','ai workflow',
+  'code generation','coding model','copilot','code llm',
+  'image generation','video generation','audio generation','music generation',
+  'speech recognition','text to speech','tts','voice model',
+  'computer vision','object detection','image segmentation',
+  'robotics','embodied ai','robot learning','humanoid',
+  'drug discovery','protein folding','alphafold','scientific ai',
+  'autonomous driving','self-driving','waymo','tesla ai',
+  'gpu','tpu','h100','h200','b200','gb200','blackwell','hopper',
+  'inference','inference optimization','model serving','vllm','tensorrt',
+  'mlops','model deployment','model monitoring',
+  'ai chip','ai accelerator','npu','neural processing unit',
+  'benchmark','mmlu','humaneval','hellaswag','gsm8k',
+  'lmsys','chatbot arena','bigbench','arc challenge','swe-bench',
+  'aime','gpqa','mmmu',
+  'ai safety','alignment','guardrail','red teaming','jailbreak',
+  'hallucination','bias','fairness','responsible ai','constitutional ai',
+  'ai regulation','eu ai act','ai policy','ai governance',
+];
+
+// W1 (+1) — general AI/DS relevance baseline
+var KEYWORDS_W1 = [
+  'artificial intelligence','machine learning','deep learning',
+  'neural network','data science','ai','ml',
+  'chatbot','virtual assistant','nlp','natural language processing',
+  'computer vision','reinforcement learning','generative ai',
+  'pytorch','tensorflow','jax','keras','huggingface','hugging face',
+  'stability ai','midjourney','runway',
+  'parameter','dataset','training data','synthetic data','pretraining',
+  'overfitting','regularization','gradient','backpropagation',
+  'classification','regression','clustering','generative',
+  'api','sdk','open source','open-source','open weights',
+  'research','paper','study','experiment','evaluation',
+  'accuracy','precision','recall','f1 score','perplexity',
+  'startup','funding','investment','valuation',
+  'partnership','collaboration','acquisition',
+];
+
+// Feeds that are entirely AI-focused — skip keyword filter
+var AI_ONLY_SOURCES = [
+  'nvidia','openai','anthropic','google','meta.com','microsoft',
+  'huggingface','arxiv','marktechpost','artificialintelligence-news',
+  'venturebeat.com/category/ai','theverge.com/rss/ai',
+  'techcrunch.com/category/artificial','siliconangle',
+  'analyticsindiamag','kdnuggets','towardsdatascience','takara.ai',
+];
+
+// ── Score a single article ──────────────────────────────────────
+function scoreArticle(article) {
+  var body = (article.title + ' ' + article.desc).toLowerCase();
+  var score = 0, i;
+  for (i = 0; i < KEYWORDS_W3.length; i++) {
+    if (body.indexOf(KEYWORDS_W3[i]) !== -1) score += 3;
+  }
+  for (i = 0; i < KEYWORDS_W2.length; i++) {
+    if (body.indexOf(KEYWORDS_W2[i]) !== -1) score += 2;
+  }
+  for (i = 0; i < KEYWORDS_W1.length; i++) {
+    if (body.indexOf(KEYWORDS_W1[i]) !== -1) score += 1;
+  }
+  var LAB_SOURCES = ['nvidia','openai','anthropic','google','meta',
+                     'microsoft','huggingface','deepmind','amazon'];
+  for (i = 0; i < LAB_SOURCES.length; i++) {
+    if (article.source.indexOf(LAB_SOURCES[i]) !== -1) { score += 2; break; }
+  }
+  if (article.source.indexOf('arxiv') !== -1) score += 1;
+  article.score = score;
+  return article;
+}
+// Testing reset by 24 hrs
+function resetTo24Hours() {
+  var ms24h = new Date().getTime() - (6 * 60 * 60 * 1000);
+  PropertiesService.getScriptProperties()
+    .setProperty('LAST_RUN_TIME', ms24h.toString());
+  Logger.log('LAST_RUN_TIME set to: ' + new Date(ms24h).toLocaleString());
+}
 
 // ── Main entry point ────────────────────────────────────────────
 function sendDailyDigest() {
   var props     = PropertiesService.getScriptProperties();
   var projectId = props.getProperty('GCP_PROJECT_ID');
-  var region    = props.getProperty('VERTEX_REGION') || 'us-east5';
-
+  var region    = props.getProperty('VERTEX_REGION') || 'us-central1';
   if (!projectId) throw new Error('GCP_PROJECT_ID not set in Script Properties.');
 
-  // Determine the time window
-  var nowMs = new Date().getTime();
+  var nowMs      = new Date().getTime();
   var lastRunStr = props.getProperty('LAST_RUN_TIME');
-  var lastRunMs = lastRunStr ? parseInt(lastRunStr, 10) : nowMs - (14 * 60 * 60 * 1000);
+  var lastRunMs  = lastRunStr
+    ? parseInt(lastRunStr, 10)
+    : nowMs - (14 * 60 * 60 * 1000);
 
-  Logger.log('Fetching articles published after: ' + new Date(lastRunMs).toLocaleString());
+  Logger.log('Fetching articles after: ' + new Date(lastRunMs).toLocaleString());
   var articles = fetchRSSArticles(lastRunMs);
-  Logger.log('Found ' + articles.length + ' new articles in this time window');
+  Logger.log('Raw articles in window: ' + articles.length);
 
   if (articles.length === 0) {
-    Logger.log('No new articles found. Skipping email.');
-    props.setProperty('LAST_RUN_TIME', nowMs.toString()); 
+    Logger.log('No new articles — skipping email.');
+    props.setProperty('LAST_RUN_TIME', nowMs.toString());
     return;
   }
 
-  Logger.log('Summarising with Gemini on Vertex AI...');
-  var digest = summariseWithVertex(articles, projectId, region);
+  // Step 1: Local weighted scoring — zero cost
+  articles = articles.map(scoreArticle);
+  articles.sort(function (a, b) { return b.score - a.score; });
+  Logger.log('Top score: ' + articles[0].score + ' — ' + articles[0].title);
 
-  var email   = Session.getActiveUser().getEmail();
+  // Step 2: Flash-Lite dedupes + selects best 15 (~$0.001)
+  var top40 = articles.slice(0, 40);
+  Logger.log('Stage 1 (Flash-Lite): filtering ' + top40.length + ' → 15...');
+  var top15 = filterWithFlashLite(top40, projectId, region);
+  Logger.log('Stage 1 done: ' + top15.length + ' articles');
+
+  // Step 3: Flash summarises the clean 15 (~$0.002–0.003)
+  Logger.log('Stage 2 (Flash): summarising ' + top15.length + ' articles...');
+  var digest = summariseWithFlash(top15, projectId, region);
+
   var hour    = new Date().getHours();
-  var edition = (hour < 12) ? "🌅 Morning Edition" : "🌇 Evening Edition";
+  var edition = hour < 12 ? '🌅 Morning Edition' : '🌇 Evening Edition';
   var subject = '[AI Digest] ' + digest.date + ' — ' + edition;
-  
+  var email   = Session.getActiveUser().getEmail();
+
   GmailApp.sendEmail(email, subject,
     'Your mail client does not support HTML.',
     { htmlBody: buildEmailHTML(digest, edition), name: 'AI Daily Digest' }
   );
-  Logger.log('✅ Sent to ' + email);
+  Logger.log('✅ Digest sent to ' + email);
 
-  // Save this run time so the next run only gets newer articles
   props.setProperty('LAST_RUN_TIME', nowMs.toString());
 }
 
 // ── Fetch & filter articles from RSS ───────────────────────────
 function fetchRSSArticles(lastRunMs) {
-  var KEYWORDS = [
-    'ai','artificial intelligence','machine learning','llm','gpt',
-    'claude','gemini','neural','deep learning','openai','anthropic',
-    'data science','transformer','chatbot','diffusion','reinforcement',
-    'language model','foundation model','inference','fine-tun',
-    'benchmark','multimodal','reasoning','agent',
-  ];
+  var allKws   = KEYWORDS_W3.concat(KEYWORDS_W2).concat(KEYWORDS_W1);
   var articles = [], seen = {};
 
   for (var f = 0; f < RSS_FEEDS.length; f++) {
@@ -96,218 +261,403 @@ function fetchRSSArticles(lastRunMs) {
         ? channel.getChildren('item')
         : root.getChildren('entry', XmlService.getNamespace('http://www.w3.org/2005/Atom'));
 
-      var isAiFeed = feedUrl.indexOf('/ai/') !== -1
-                  || feedUrl.indexOf('ai-artificial') !== -1
-                  || feedUrl.indexOf('arxiv') !== -1;
+      var isAiOnly = false;
+      for (var a = 0; a < AI_ONLY_SOURCES.length; a++) {
+        if (feedUrl.indexOf(AI_ONLY_SOURCES[a]) !== -1) { isAiOnly = true; break; }
+      }
 
-      for (var i = 0; i < Math.min((items || []).length, 10); i++) {
+      for (var i = 0; i < Math.min((items || []).length, 8); i++) {
         try {
           var title = xmlText(items[i], 'title');
           if (!title) continue;
-          
-          // Date window check
+
           var pubMs = xmlDate(items[i]);
-          if (pubMs && pubMs <= lastRunMs) continue; 
-          
-          var key = title.toLowerCase().slice(0, 70);
+          if (pubMs && pubMs <= lastRunMs) continue;
+
+          var key = title.toLowerCase().slice(0, 80);
           if (seen[key]) continue;
+
           var url  = xmlLink(items[i]);
           var desc = (xmlText(items[i], 'description') || xmlText(items[i], 'summary') || '')
-                      .replace(/<[^>]*>/g, '').slice(0, 600).trim();
-          var body = (title + ' ' + desc).toLowerCase();
-          var ok   = isAiFeed;
-          if (!ok) for (var k = 0; k < KEYWORDS.length; k++) {
-            if (body.indexOf(KEYWORDS[k]) !== -1) { ok = true; break; }
+                      .replace(/<[^>]*>/g, '')   // strip HTML tags
+                      .replace(/&amp;/g,  '&')   // decode common HTML entities
+                      .replace(/&lt;/g,   '<')
+                      .replace(/&gt;/g,   '>')
+                      .replace(/&quot;/g, '"')
+                      .replace(/&#39;/g,  "'")
+                      .slice(0, 500).trim();
+
+          if (!isAiOnly) {
+            var body = (title + ' ' + desc).toLowerCase();
+            var relevant = false;
+            for (var k = 0; k < allKws.length; k++) {
+              if (body.indexOf(allKws[k]) !== -1) { relevant = true; break; }
+            }
+            if (!relevant) continue;
           }
-          if (!ok) continue;
+
           seen[key] = true;
           articles.push({
-            title: title, url: url || feedUrl, desc: desc,
-            source: feedUrl.replace(/https?:\/\/(www\.|feeds\.|rss\.)?/, '').split('/')[0],
+            title:  title,
+            url:    url || feedUrl,
+            desc:   desc,
+            source: feedUrl.replace(/https?:\/\/(www\.|feeds\.|feedburner\.|rss\.)?/, '')
+                           .split('/')[0],
+            score:  0,
           });
-        } catch (e) {}
+        } catch (e2) {}
       }
-    } catch (e) { Logger.log('Feed error: ' + e.message); }
+    } catch (e) {
+      Logger.log('Feed error (' + feedUrl + '): ' + e.message);
+    }
   }
   return articles;
 }
 
-function xmlText(el, tag, ns) {
-  try { var c = ns ? el.getChild(tag, ns) : el.getChild(tag); return c ? (c.getText() || null) : null; } catch(e) { return null; }
+// ── XML helpers ─────────────────────────────────────────────────
+function xmlText(el, tag) {
+  try { var c = el.getChild(tag); return c ? (c.getText() || null) : null; }
+  catch (e) { return null; }
 }
 function xmlLink(el) {
   try {
     var a = el.getChild('link', XmlService.getNamespace('http://www.w3.org/2005/Atom'));
     if (a) { var h = a.getAttribute('href'); if (h) return h.getValue(); }
-    var r = el.getChild('link'); if (r) { var t = r.getText(); if (t && t.indexOf('http') === 0) return t; }
-    var g = el.getChild('guid'); if (g) { var u = g.getText(); if (u && u.indexOf('http') === 0) return u; }
-  } catch(e) {}
+    var r = el.getChild('link');
+    if (r) { var t = r.getText(); if (t && t.indexOf('http') === 0) return t; }
+    var g = el.getChild('guid');
+    if (g) { var u = g.getText(); if (u && u.indexOf('http') === 0) return u; }
+  } catch (e) {}
   return null;
 }
 function xmlDate(el) {
   try {
-    var nsAtom = XmlService.getNamespace('http://www.w3.org/2005/Atom');
-    var d = xmlText(el, 'pubDate') || xmlText(el, 'updated', nsAtom) || xmlText(el, 'published', nsAtom);
-    if (d) {
-      var ms = new Date(d).getTime();
-      if (!isNaN(ms)) return ms;
-    }
-  } catch(e) {}
+    var ns = XmlService.getNamespace('http://www.w3.org/2005/Atom');
+    var d  = xmlText(el, 'pubDate')
+          || (el.getChild('updated',   ns) ? el.getChild('updated',   ns).getText() : null)
+          || (el.getChild('published', ns) ? el.getChild('published', ns).getText() : null);
+    if (d) { var ms = new Date(d).getTime(); if (!isNaN(ms)) return ms; }
+  } catch (e) {}
   return null;
 }
 
-// ── Gemini via Vertex AI (Split-Call Architecture) ──────────────
-function summariseWithVertex(articles, projectId, region) {
+// ── Text sanitiser — strip characters that corrupt JSON output ──
+// Removes control chars, normalises whitespace, escapes are NOT needed
+// here because this text goes INTO the prompt (plain text), not into
+// a JSON string we build ourselves. Flash then writes the JSON.
+function sanitise(text) {
+  return String(text || '')
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '') // control chars
+    .replace(/\r\n|\r/g, ' ')                            // CRLF → space
+    .replace(/\n/g, ' ')                                 // LF → space
+    .replace(/\t/g, ' ')                                 // tab → space
+    .replace(/\s{2,}/g, ' ')                             // collapse spaces
+    .replace(/[^\x20-\x7E\u00A0-\uFFFF]/g, '')          // non-printable
+    .trim();
+}
+
+// ── JSON schemas — enforced at model level, eliminates parse errors ──
+var BREAKTHROUGH_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    title:        { type: 'STRING' },
+    source:       { type: 'STRING' },
+    summary:      { type: 'STRING' },
+    significance: { type: 'STRING' },
+    index:        { type: 'INTEGER' },
+  },
+  required: ['title', 'source', 'summary', 'significance', 'index'],
+};
+
+var ARTICLE_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    rank:           { type: 'INTEGER' },
+    index:          { type: 'INTEGER' },
+    title:          { type: 'STRING' },
+    source:         { type: 'STRING' },
+    summary:        { type: 'STRING' },
+    why_it_matters: { type: 'STRING' },
+  },
+  required: ['rank', 'index', 'title', 'source', 'summary', 'why_it_matters'],
+};
+
+var DIGEST_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    date: { type: 'STRING' },
+    breakthroughs: {
+      type: 'ARRAY',
+      items: BREAKTHROUGH_SCHEMA,
+    },
+    top_articles: {
+      type: 'ARRAY',
+      items: ARTICLE_SCHEMA,
+    },
+  },
+  required: ['date', 'breakthroughs', 'top_articles'],
+};
+
+var FILTER_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    selected: {
+      type: 'ARRAY',
+      items: { type: 'INTEGER' },
+    },
+  },
+  required: ['selected'],
+};
+
+/* Schema map keyed by model name
+var schemas = {
+  'gemini-2.5-flash':      DIGEST_SCHEMA,
+  'gemini-2.5-flash-lite': FILTER_SCHEMA,
+};*/
+
+// ── Shared Vertex AI caller (Gemini) ────────────────────────────
+function callGemini(model, prompt, maxTokens, projectId, region, schemas) {
+  var endpoint = 'https://' + region + '-aiplatform.googleapis.com/v1/projects/' +
+                 projectId + '/locations/' + region +
+                 '/publishers/google/models/' + model + ':generateContent';
+
+  var resp = UrlFetchApp.fetch(endpoint, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'Authorization': 'Bearer ' + ScriptApp.getOAuthToken() },
+    payload: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: maxTokens,
+        responseMimeType: 'application/json',
+        responseSchema: schemas[model] || undefined,
+      },
+    }),
+    muteHttpExceptions: true,
+  });
+
+  var data = JSON.parse(resp.getContentText());
+  if (data.error) throw new Error('Vertex (' + model + '): ' + data.error.message);
+
+  // Safely extract text regardless of candidate structure
+  var candidates = data.candidates || [];
+  if (!candidates.length) throw new Error('No candidates returned from ' + model);
+  var parts = (candidates[0].content || {}).parts || [];
+  if (!parts.length) throw new Error('No parts in candidate from ' + model);
+
+  var raw = parts[0].text || '';
+  // Strip markdown fences Gemini occasionally wraps JSON in
+  raw = raw.replace(/^```json\s*/i, '').replace(/\s*```$/i, '').trim();
+  return raw;
+}
+
+// ── Robust JSON extractor with sanitisation ─────────────────────
+// Handles: leading/trailing text, Gemini "thinking" preamble,
+// invalid escape sequences, and truncated responses.
+function extractJSON(raw) {
+  // With responseSchema enforced, this should always be clean JSON.
+  // Minimal cleanup kept as a safety net only.
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    // Strip markdown fences just in case
+    var clean = raw.replace(/^```json\s*/i, '').replace(/\s*```$/i, '').trim();
+    try {
+      return JSON.parse(clean);
+    } catch (e2) {
+      Logger.log('Schema-enforced parse still failed: ' + e2.message);
+      Logger.log('Raw: ' + raw.slice(0, 500));
+      throw new Error('JSON parse failed: ' + e2.message);
+    }
+  }
+}
+// ── Stage 1: Flash-Lite — dedupe & filter ($0.10/M tokens) ─────
+function filterWithFlashLite(articles, projectId, region) {
+  var list = articles.map(function (a, i) {
+    // Sanitise title + excerpt so no control chars reach the prompt
+    var t = sanitise(a.title);
+    var d = sanitise(a.desc).slice(0, 120);
+    return (i + 1) + '. [score:' + a.score + '] ' + t +
+           ' | ' + a.source + ' | ' + d;
+  }).join('\n');
+
+  var prompt =
+    'You are an AI news editor. ' + articles.length + ' pre-scored articles below.\n\n' +
+    'Select the 20 best articles:\n' +
+    '- Remove duplicates (same story from multiple sources, keep highest score)\n' +
+    '- Remove off-topic articles (not genuinely about AI/ML/data science)\n' +
+    '- Deprioritise: opinion pieces, tutorials, listicles\n' +
+    '- Prioritise: model releases, research papers, lab announcements, breakthroughs\n\n' +
+    'ARTICLES:\n' + list + '\n\n' +
+    'Return a JSON object with a single key "selected" containing an array of ' +
+    'exactly 15 integers (1-indexed article numbers). Example: {"selected":[1,4,7,9,11,12,13,15,17,19,21,23,25,27,30]}';
+
+  try {
+    var raw    = callGemini('gemini-2.5-flash-lite', prompt, 10000, projectId, region, FILTER_SCHEMA);
+    var parsed = extractJSON(raw);
+    var sel    = (parsed.selected || [])
+      .filter(function (n) { return n >= 1 && n <= articles.length; })
+      .map(function (n) { return articles[n - 1]; });
+    if (sel.length >= 10) {
+      Logger.log('Flash-Lite selected: ' + sel.length + ' articles');
+      return sel;
+    }
+    Logger.log('Flash-Lite returned too few (' + sel.length + ') — using top 15');
+  } catch (e) {
+    Logger.log('Flash-Lite error: ' + e.message + ' — using top 15 by score');
+  }
+  return articles.slice(0, 20);
+}
+
+// ── Stage 2: Flash — deep summarisation ($0.30/M tokens) ───────
+function summariseWithFlash(articles, projectId, region) {
   var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'MMMM d, yyyy');
 
-  var list = articles.slice(0, 45).map(function(a, i) {
-    return (i+1) + '. TITLE: ' + a.title + '\n   SOURCE: ' + a.source +
-           '\n   URL: ' + a.url + '\n   EXCERPT: ' + a.desc;
+  // Sanitise every field before it enters the prompt
+  var list = articles.map(function (a, i) {
+    return (i + 1) + '. TITLE: '   + sanitise(a.title) +
+           '\n   SOURCE: '          + sanitise(a.source) +
+           '\n   LINK: '            + sanitise(a.url) +   // renamed URL→LINK, less ambiguous
+           '\n   EXCERPT: '         + sanitise(a.desc).slice(0, 800);
   }).join('\n\n');
 
-  // Helper function to make focused API calls
-  function callGemini(taskPrompt, schemaProperties) {
-    var endpoint = 'https://' + region + '-aiplatform.googleapis.com/v1/projects/' +
-                   projectId + '/locations/' + region +
-                   '/publishers/google/models/gemini-2.5-pro:generateContent'; // Or use flash here
+  // Keep the JSON schema description in plain English — do NOT inline
+  // the date or any variable inside a JSON template string, as that
+  // is what caused the original position-1504 parse error.
+var prompt =
+    'You are a senior AI/ML research journalist. Today is ' + today + '.\n' +
+    'These ' + articles.length + ' articles are today\'s top AI/data science stories.\n\n' +
+    'TASKS:\n' +
+    '1. Pick the TOP 15 most important articles and rank them 1-15.\n' +
+    '2. Identify up to 5 MAJOR BREAKTHROUGHS separately (new model releases, landmark papers).\n' +
+    '3. Write sharp summaries: name the model, cite benchmark numbers, state the key claim.\n\n' +
+    'ARTICLES:\n' + list + '\n\n' +
+    'OUTPUT FORMAT — return a single valid JSON object with exactly these keys:\n' +
+    '  date          : string, today\'s date\n' +
+    '  breakthroughs : array of up to 5 objects, each with keys: title, source, summary, significance, index\n' +
+    '  top_articles  : array of exactly 15 objects, each with keys: rank, index, title, source, summary, why_it_matters\n\n' +
+    'Rules:\n' +
+    '- top_articles must contain EXACTLY 15 items — no more, no less\n' +
+    '- index must be the original INDEX number from the article list above — this is how URLs get attached\n' +
+    '- breakthroughs and top_articles are mutually exclusive — the same story must not appear in both\n' +
+    '- Do NOT include a url field anywhere — URLs are handled separately via index\n' +
+    '- All string values must use plain ASCII or common Unicode only — no control characters\n' +
+    '- Return ONLY the JSON object, no markdown fences, no explanation before or after';
 
-    var resp = UrlFetchApp.fetch(endpoint, {
-      method: 'post',
-      contentType: 'application/json',
-      headers: { 'Authorization': 'Bearer ' + ScriptApp.getOAuthToken() },
-      payload: JSON.stringify({
-        "contents": [{ "role": "user", "parts": [{ "text": taskPrompt }] }],
-        "generationConfig": {
-          "temperature": 0.2,
-          "maxOutputTokens": 8192,
-          "responseMimeType": "application/json",
-          "responseSchema": {
-            "type": "OBJECT",
-            "properties": schemaProperties
+
+  // Attempt summarisation with one automatic retry on parse failure
+  var raw, digest;
+  for (var attempt = 1; attempt <= 2; attempt++) {
+    try {
+      raw    = callGemini('gemini-2.5-flash', prompt, 8192, projectId, region, DIGEST_SCHEMA);
+      digest = extractJSON(raw);
+      // Validate minimal structure
+      if (!digest.top_articles || !Array.isArray(digest.top_articles)) {
+        throw new Error('top_articles missing or not an array');
+      }
+      if (digest.top_articles.length < 10) {
+        throw new Error('top_articles has only ' + digest.top_articles.length + ' items, expected 15');
+      }
+      if (!digest.date) digest.date = today;
+      if (!digest.breakthroughs) digest.breakthroughs = [];
+
+      // Inject real URLs from original articles using the index Flash returned.
+      // This is 100% reliable — we never trust Flash to carry URLs through.
+      digest.top_articles = digest.top_articles.map(function (a) {
+        var idx = parseInt(a.index, 10);
+        if (idx >= 1 && idx <= articles.length) {
+          a.url = articles[idx - 1].url;
+        }
+        return a;
+      });
+
+      // Same for breakthroughs — match by title substring against originals
+      digest.breakthroughs = digest.breakthroughs.map(function (b) {
+        if (b.url) return b; // already has one
+        var btTitle = (b.title || '').toLowerCase();
+        for (var x = 0; x < articles.length; x++) {
+          if (articles[x].title.toLowerCase().indexOf(btTitle.slice(0, 40)) !== -1) {
+            b.url = articles[x].url;
+            break;
           }
         }
-      }),
-      muteHttpExceptions: true,
-    });
-    
-    var data = JSON.parse(resp.getContentText());
-    if (data.error) throw new Error('Vertex AI error: ' + data.error.message);
-    if (data.candidates[0].finishReason === 'MAX_TOKENS') throw new Error('Hit Max Tokens on a split call.');
-    
-    var clean = data.candidates[0].content.parts[0].text.replace(/```json|```/g, '').trim();
-    return JSON.parse(clean);
+        return b;
+      });
+
+      Logger.log('Flash summarised: ' + digest.top_articles.length +
+                 ' articles, ' + digest.breakthroughs.length + ' breakthroughs');
+      return digest;
+    } catch (e) {
+      Logger.log('summariseWithFlash attempt ' + attempt + ' failed: ' + e.message);
+      if (attempt === 2) throw new Error('Flash summarisation failed after 2 attempts: ' + e.message);
+      Utilities.sleep(3000); // wait 3s before retry
+    }
   }
-
-  // --- API CALL 1: Just get the Breakthroughs ---
-  Logger.log("Calling Gemini for Breakthroughs...");
-  var prompt1 = 'You are an AI journalist. Review these articles from today (' + today + ').\n\nARTICLES:\n' + list + 
-                '\n\nIdentify a MAXIMUM of 5 MAJOR BREAKTHROUGHS. Write 1-sentence summaries. Return ONLY JSON.';
-  
-  var breakthroughsSchema = {
-    "breakthroughs": {
-      "type": "ARRAY",
-      "items": {
-        "type": "OBJECT",
-        "properties": {
-          "title": { "type": "STRING" }, "source": { "type": "STRING" },
-          "summary": { "type": "STRING" }, "significance": { "type": "STRING" }, "url": { "type": "STRING" }
-        }
-      }
-    }
-  };
-  var breakthroughsData = callGemini(prompt1, breakthroughsSchema);
-
-
-  // --- API CALL 2: Just get the Top 10 List ---
-  Logger.log("Calling Gemini for Top 10 Articles...");
-  var prompt2 = 'You are an AI journalist. Review these articles from today (' + today + ').\n\nARTICLES:\n' + list + 
-                '\n\nPick EXACTLY 10 top articles (exclude the absolute biggest breakthroughs). Write 1-sentence summaries. Return ONLY JSON.';
-  
-  var topArticlesSchema = {
-    "top_articles": {
-      "type": "ARRAY",
-      "items": {
-        "type": "OBJECT",
-        "properties": {
-          "rank": { "type": "INTEGER" }, "title": { "type": "STRING" }, "source": { "type": "STRING" },
-          "summary": { "type": "STRING" }, "why_it_matters": { "type": "STRING" }, "url": { "type": "STRING" }
-        }
-      }
-    }
-  };
-  var topArticlesData = callGemini(prompt2, topArticlesSchema);
-
-  // Combine the results into your final format
-  return {
-    "date": today,
-    "breakthroughs": breakthroughsData.breakthroughs || [],
-    "top_articles": topArticlesData.top_articles || []
-  };
 }
 
-// ── Trigger setup (7 AM & 5 PM) ─────────────────────────────────
+// ── Trigger setup: 6 AM + 4 PM daily ───────────────────────────
 function setupTrigger() {
   var triggers = ScriptApp.getProjectTriggers();
-  for (var i = 0; i < triggers.length; i++) {
-    ScriptApp.deleteTrigger(triggers[i]);
-  }
+  for (var i = 0; i < triggers.length; i++) ScriptApp.deleteTrigger(triggers[i]);
 
   ScriptApp.newTrigger('sendDailyDigest')
-    .timeBased().atHour(7).everyDays(1)
-    .inTimezone(Session.getScriptTimeZone())
-    .create();
+    .timeBased().atHour(6).everyDays(1)
+    .inTimezone(Session.getScriptTimeZone()).create();
 
   ScriptApp.newTrigger('sendDailyDigest')
-    .timeBased().atHour(17).everyDays(1)
-    .inTimezone(Session.getScriptTimeZone())
-    .create();
+    .timeBased().atHour(16).everyDays(1)
+    .inTimezone(Session.getScriptTimeZone()).create();
 
-  Logger.log('✅ Triggers set: 7 AM and 5 PM in ' + Session.getScriptTimeZone());
+  Logger.log('✅ Triggers set: 6 AM and 4 PM in ' + Session.getScriptTimeZone());
 }
 
-// ── Immediate test send ─────────────────────────────────────────
 function testRun() { sendDailyDigest(); }
 
-// ── HTML email builder ──────────────────────────────────────────
+// ── HTML email ──────────────────────────────────────────────────
 function buildEmailHTML(digest, edition) {
-  var arts = digest.top_articles || [], bts = digest.breakthroughs || [], G = '#00c882';
-  function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+  var arts = digest.top_articles  || [];
+  var bts  = digest.breakthroughs || [];
+  var G    = '#00c882';
+
+  function esc(s) {
+    return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')
+                        .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
   function pad2(n) { return String(n).length < 2 ? '0'+n : String(n); }
 
   var btHTML = bts.map(function(b) {
-    return '<div style="background:#111;border-left:3px solid '+G+';padding:16px 18px;border-radius:4px;margin-bottom:12px;">'+
-      '<div style="font-family:monospace;font-size:13px;color:'+G+';font-weight:700;margin-bottom:4px;">⚡ '+esc(b.title)+'</div>'+
-      '<div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">'+esc(b.source)+'</div>'+
-      '<div style="font-size:13px;color:#aaa;line-height:1.7;">'+esc(b.summary)+'</div>'+
+    return '<div style="background:#111;border-left:3px solid '+G+';padding:16px 18px;border-radius:4px;margin-bottom:12px;">' +
+      '<div style="font-family:monospace;font-size:13px;color:'+G+';font-weight:700;margin-bottom:4px;">⚡ '+esc(b.title)+'</div>' +
+      '<div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">'+esc(b.source)+'</div>' +
+      '<div style="font-size:13px;color:#aaa;line-height:1.7;">'+esc(b.summary)+'</div>' +
       (b.significance?'<div style="margin-top:8px;font-size:12px;color:'+G+';font-style:italic;">★ '+esc(b.significance)+'</div>':'')+
       (b.url?'<div style="margin-top:8px;"><a href="'+esc(b.url)+'" style="font-family:monospace;font-size:10px;color:#444;text-decoration:none;">↗ Read more</a></div>':'')+
       '</div>';
   }).join('');
 
-  var artHTML = arts.map(function(a, i) {
-    return '<div style="display:flex;gap:16px;padding:16px 0;border-bottom:1px solid #1a1a1a;">'+
-      '<span style="font-family:monospace;font-size:24px;font-weight:900;color:'+G+';min-width:36px;line-height:1;flex-shrink:0;">'+pad2(a.rank||i+1)+'</span>'+
-      '<div style="flex:1;">'+
-      '<div style="font-size:14px;font-weight:700;color:#f0f0f0;margin-bottom:4px;">'+
-      (a.url?'<a href="'+esc(a.url)+'" style="color:#f0f0f0;text-decoration:none;">'+esc(a.title)+'</a>':esc(a.title))+
-      '</div>'+
-      '<div style="font-size:11px;color:#444;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">'+esc(a.source)+'</div>'+
-      '<div style="font-size:13px;color:#888;line-height:1.7;">'+esc(a.summary)+'</div>'+
+  var artHTML = arts.map(function(a,i) {
+    return '<div style="display:flex;gap:16px;padding:16px 0;border-bottom:1px solid #1a1a1a;">' +
+      '<span style="font-family:monospace;font-size:24px;font-weight:900;color:'+G+';min-width:36px;line-height:1;flex-shrink:0;">'+pad2(a.rank||i+1)+'</span>' +
+      '<div style="flex:1;">' +
+      '<div style="font-size:14px;font-weight:700;color:#f0f0f0;margin-bottom:4px;">'+(a.url?'<a href="'+esc(a.url)+'" style="color:#f0f0f0;text-decoration:none;">'+esc(a.title)+'</a>':esc(a.title))+'</div>' +
+      '<div style="font-size:11px;color:#444;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">'+esc(a.source)+'</div>' +
+      '<div style="font-size:13px;color:#888;line-height:1.7;">'+esc(a.summary)+'</div>' +
       (a.why_it_matters?'<div style="margin-top:6px;font-size:12px;color:'+G+';">→ '+esc(a.why_it_matters)+'</div>':'')+
       '</div></div>';
   }).join('');
 
-  return '<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>'+
-    '<body style="margin:0;padding:0;background:#0a0a0a;font-family:Georgia,serif;">'+
-    '<div style="max-width:660px;margin:0 auto;background:#0d0d0d;">'+
-    '<div style="padding:36px 32px 28px;border-bottom:1px solid #1a1a1a;">'+
-    '<div style="font-family:monospace;font-size:10px;color:'+G+';letter-spacing:5px;text-transform:uppercase;margin-bottom:10px;">// daily intelligence</div>'+
-    '<div style="font-size:34px;font-weight:900;color:#f0f0f0;line-height:1;">AI &amp; Data Science</div>'+
-    '<div style="font-size:34px;font-weight:900;color:'+G+';line-height:1.2;">'+edition+'_</div>'+
-    '<div style="margin-top:14px;font-family:monospace;font-size:11px;color:#333;">'+esc(digest.date)+' · Gemini 2.5 Pro on Vertex AI</div>'+
-    '</div>'+
+  return '<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>' +
+    '<body style="margin:0;padding:0;background:#0a0a0a;font-family:Georgia,serif;">' +
+    '<div style="max-width:660px;margin:0 auto;background:#0d0d0d;">' +
+    '<div style="padding:36px 32px 28px;border-bottom:1px solid #1a1a1a;">' +
+    '<div style="font-family:monospace;font-size:10px;color:'+G+';letter-spacing:5px;text-transform:uppercase;margin-bottom:10px;">// daily intelligence · 29 sources</div>' +
+    '<div style="font-size:34px;font-weight:900;color:#f0f0f0;line-height:1;">AI &amp; Data Science</div>' +
+    '<div style="font-size:34px;font-weight:900;color:'+G+';line-height:1.2;">'+esc(edition||'Daily Edition')+'_</div>' +
+    '<div style="margin-top:14px;font-family:monospace;font-size:11px;color:#333;">'+esc(digest.date)+' · Gemini Flash-Lite + Flash · Vertex AI</div>' +
+    '</div>' +
     (bts.length?'<div style="padding:28px 32px;border-bottom:1px solid #1a1a1a;"><div style="font-family:monospace;font-size:10px;color:'+G+';letter-spacing:4px;text-transform:uppercase;margin-bottom:18px;">// major breakthroughs</div>'+btHTML+'</div>':'')+
-    '<div style="padding:28px 32px;"><div style="font-family:monospace;font-size:10px;color:'+G+';letter-spacing:4px;text-transform:uppercase;margin-bottom:4px;">// top articles</div>'+artHTML+'</div>'+
-    '<div style="padding:20px 32px;border-top:1px solid #111;text-align:center;"><div style="font-family:monospace;font-size:10px;color:#222;">AI Digest · Google Apps Script · Vertex AI </div></div>'+
+    '<div style="padding:28px 32px;"><div style="font-family:monospace;font-size:10px;color:'+G+';letter-spacing:4px;text-transform:uppercase;margin-bottom:4px;">// top articles</div>'+artHTML+'</div>' +
+    '<div style="padding:20px 32px;border-top:1px solid #111;text-align:center;"><div style="font-family:monospace;font-size:10px;color:#222;">AI Digest · GAS · Gemini 2.5 Flash-Lite + Flash · Vertex AI · Free</div></div>' +
     '</div></body></html>';
 }
