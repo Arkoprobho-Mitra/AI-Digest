@@ -57,7 +57,7 @@ var RSS_FEEDS = [
   'https://nvidianews.nvidia.com/rss.xml',
   'https://openai.com/blog/rss.xml',
   'https://blog.google/technology/ai/rss/',
-  'https://about.fb.com/news/category/artificial-intelligence/feed/',
+  //'https://about.fb.com/news/category/artificial-intelligence/feed/',
   'https://blogs.microsoft.com/ai/feed/',
   'https://aws.amazon.com/blogs/machine-learning/feed/',
   'https://huggingface.co/blog/feed.xml',
@@ -209,20 +209,27 @@ function scoreArticle(article) {
 
 // ── Reset helper for testing ────────────────────────────────────
 function resetTo24Hours() {
-  var ms24h = new Date().getTime() - (48 * 60 * 60 * 1000);
+  var ms24h = new Date().getTime() - (24 * 60 * 60 * 1000);
   PropertiesService.getScriptProperties()
     .setProperty('LAST_RUN_TIME', ms24h.toString());
   Logger.log('LAST_RUN_TIME set to: ' + new Date(ms24h).toLocaleString());
 }
 
 // ── Main entry point ────────────────────────────────────────────
+// ── Main entry point ────────────────────────────────────────────
 function sendDailyDigest() {
   var props     = PropertiesService.getScriptProperties();
   var projectId = props.getProperty('GCP_PROJECT_ID');
   var region    = props.getProperty('VERTEX_REGION') || 'us-central1';
+  var email     = props.getProperty('RECIPIENT_EMAIL');
+
+  if (!email) {
+    Logger.log('FATAL: RECIPIENT_EMAIL not set in Script Properties.');
+    throw new Error('RECIPIENT_EMAIL not set in Script Properties.');
+  }
 
   if (!projectId) {
-    Logger.log('FATAL: GCP_PROJECT_ID not set in Script Properties.');
+    sendSystemAlert('Setup Error', 'GCP_PROJECT_ID is missing from Script Properties.');
     throw new Error('GCP_PROJECT_ID not set in Script Properties.');
   }
 
@@ -235,68 +242,65 @@ function sendDailyDigest() {
   Logger.log('=== Digest run started at ' + new Date(nowMs).toLocaleString() + ' ===');
   Logger.log('Fetching articles after: ' + new Date(lastRunMs).toLocaleString());
 
-  // ── Step 1: Fetch RSS ───────────────────────────────────────
-  var articles = [];
+  // Wrap the core logic in a try-catch for error alerting
   try {
-    articles = fetchRSSArticles(lastRunMs);
-  } catch (e) {
-    Logger.log('FATAL: RSS fetch failed: ' + e.message);
-    throw e;
-  }
-  Logger.log('Raw articles in window: ' + articles.length);
+    // ── Step 1: Fetch RSS ───────────────────────────────────────
+    var articles = fetchRSSArticles(lastRunMs);
+    Logger.log('Raw articles in window: ' + articles.length);
 
-  if (articles.length === 0) {
-    Logger.log('No new articles — skipping email.');
-    props.setProperty('LAST_RUN_TIME', nowMs.toString());
-    return;
-  }
+    // FEATURE: Alert on zero articles
+    if (articles.length === 0) {
+      Logger.log('No new articles — sending alert.');
+      sendSystemAlert('Zero Articles Found', 'The script executed successfully, but found 0 new articles in the monitored time window.');
+      props.setProperty('LAST_RUN_TIME', nowMs.toString());
+      return;
+    }
 
-  // ── Step 2: Local weighted scoring ─────────────────────────
-  articles = articles.map(scoreArticle);
-  articles.sort(function (a, b) { return b.score - a.score; });
-  Logger.log('Top local score: ' + articles[0].score + ' — ' + articles[0].title);
+    // ── Step 2: Local weighted scoring ─────────────────────────
+    articles = articles.map(scoreArticle);
+    articles.sort(function (a, b) { return b.score - a.score; });
+    Logger.log('Top local score: ' + articles[0].score + ' — ' + articles[0].title);
 
-  // ── Step 3: Flash-Lite deduplication & selection ───────────
-  var candidatePool;
-  try {
-    var top60 = articles.slice(0, 60);
-    Logger.log('Stage 1 (Flash-Lite): filtering ' + top60.length + ' → 45...');
-    candidatePool = filterWithFlashLite(top60, projectId, region);
-    Logger.log('Stage 1 done: ' + candidatePool.length + ' candidates');
-  } catch (e) {
-    Logger.log('Stage 1 failed, falling back to top-45 by score: ' + e.message);
-    candidatePool = articles.slice(0, 45);
-  }
+    // ── Step 3: Flash-Lite deduplication & selection ───────────
+    var candidatePool;
+    try {
+      var top60 = articles.slice(0, 60);
+      Logger.log('Stage 1 (Flash-Lite): filtering ' + top60.length + ' → 45...');
+      candidatePool = filterWithFlashLite(top60, projectId, region);
+      Logger.log('Stage 1 done: ' + candidatePool.length + ' candidates');
+    } catch (e) {
+      Logger.log('Stage 1 failed, falling back to top-45 by score: ' + e.message);
+      candidatePool = articles.slice(0, 45);
+    }
 
-  // ── Step 4: Flash chunked summarisation ────────────────────
-  Logger.log('Stage 2 (Flash): chunked summarisation of ' + candidatePool.length + ' articles...');
-  var digest = summariseInChunks(candidatePool, projectId, region);
+    // ── Step 4: Flash chunked summarisation ────────────────────
+    Logger.log('Stage 2 (Flash): chunked summarisation of ' + candidatePool.length + ' articles...');
+    var digest = summariseInChunks(candidatePool, projectId, region);
 
-  // ── Step 5: Build & send email ─────────────────────────────
-  var hour    = new Date().getHours();
-  var edition = hour < 12 ? '🌅 Morning Edition' : '🌇 Evening Edition';
-  var subject = '[AI Digest] ' + digest.date + ' — ' + edition +
-                ' (' + digest.breakthroughs.length + ' breakthroughs, ' +
-                digest.top_articles.length + ' articles)';
-  var email = props.getProperty('RECIPIENT_EMAIL');
+    // ── Step 5: Build & send email ─────────────────────────────
+    var hour    = new Date().getHours();
+    var edition = hour < 12 ? '🌅 Morning Edition' : '🌇 Evening Edition';
+    var subject = '[AI Digest] ' + digest.date + ' — ' + edition +
+                  ' (' + digest.breakthroughs.length + ' breakthroughs, ' +
+                  digest.top_articles.length + ' articles)';
 
-  if (!email) {
-    Logger.log('FATAL: RECIPIENT_EMAIL not set in Script Properties.');
-    throw new Error('RECIPIENT_EMAIL not set in Script Properties.');
-  }
-  try {
     GmailApp.sendEmail(email, subject,
       'Your mail client does not support HTML.',
       { htmlBody: buildEmailHTML(digest, edition), name: 'AI Daily Digest' }
     );
     Logger.log('✅ Digest sent to ' + email);
-  } catch (e) {
-    Logger.log('FATAL: Email send failed: ' + e.message);
-    throw e;
-  }
 
-  props.setProperty('LAST_RUN_TIME', nowMs.toString());
-  Logger.log('=== Digest run complete ===');
+    props.setProperty('LAST_RUN_TIME', nowMs.toString());
+    Logger.log('=== Digest run complete ===');
+
+  } catch (globalError) {
+    // FEATURE: Alert on execution crash
+    Logger.log('FATAL EXECUTION ERROR: ' + globalError.message);
+    sendSystemAlert('Execution Crashed', 'The daily digest failed to run. Error details:<br><br><code style="background:#222;padding:8px;display:block;color:#f77;">' + globalError.message + '</code><br><br>Check the Apps Script execution logs for the full stack trace.');
+    
+    // Rethrow so the Apps Script dashboard still logs it as a "Failed" execution
+    throw globalError; 
+  }
 }
 
 // ── Fetch & filter articles from RSS ───────────────────────────
@@ -391,7 +395,7 @@ function fetchRSSArticles(lastRunMs) {
           title = sanitise(title);
 
           var pubMs = xmlDate(items[i]);
-          //if (pubMs && pubMs <= lastRunMs) continue;
+          if (pubMs && pubMs <= lastRunMs) continue;
 
           var key = title.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 80);
           if (seen[key]) continue;
@@ -1267,3 +1271,33 @@ function runDiagnostic() {
     Logger.log("XML Parsing crashed: " + e.message);
   }
 }
+
+// ── System Alert Emailer ────────────────────────────────────────
+function sendSystemAlert(subject, message) {
+  var email = PropertiesService.getScriptProperties().getProperty('RECIPIENT_EMAIL');
+  
+  if (!email) {
+    Logger.log('Cannot send alert: RECIPIENT_EMAIL not set.');
+    return;
+  }
+  
+  var htmlBody = '<div style="font-family: monospace; padding: 20px; background: #111; color: #eee; border-radius: 5px;">' +
+                 '<h2 style="color: #f5c542;">⚠️ AI Digest System Alert</h2>' +
+                 '<p>' + message + '</p>' +
+                 '<hr style="border-color: #333; margin-top: 20px;" />' +
+                 '<small style="color: #888;">Generated at ' + new Date().toLocaleString() + '</small>' +
+                 '</div>';
+                 
+  try {
+    GmailApp.sendEmail(email, '[AI Digest Alert] ' + subject, 'Your mail client does not support HTML.', { 
+      htmlBody: htmlBody, 
+      name: 'AI Digest System' 
+    });
+    Logger.log('Alert email sent: ' + subject);
+  } catch (e) {
+    Logger.log('Failed to send alert email: ' + e.message);
+  }
+}
+
+
+
